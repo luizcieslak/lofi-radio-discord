@@ -5,13 +5,19 @@ import { HealthServer } from './healthServer.ts'
 import { errorMessage, logger } from './logger.ts'
 import { createFfmpegMediaSource } from './mediaSource.ts'
 import { RuntimeStatus } from './runtimeStatus.ts'
+import { SqliteAssignmentStore } from './stateStore.ts'
 
 async function main(): Promise<void> {
 	const config = loadConfig()
 	const status = new RuntimeStatus()
+	const store = new SqliteAssignmentStore(config.stateDatabasePath)
+	status.setStorage('ready')
 	const healthServer = new HealthServer(config.port, status)
-	const bot = new RadioBot(config, status, () =>
-		createFfmpegMediaSource(config.ffmpegPath, config.radioStreamUrl),
+	const bot = new RadioBot(
+		config,
+		status,
+		() => createFfmpegMediaSource(config.ffmpegPath, config.radioStreamUrl),
+		store,
 	)
 
 	await healthServer.start()

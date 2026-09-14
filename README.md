@@ -1,35 +1,34 @@
 # lofi-radio-discord
 
-A resilient, single-guild Discord bot that relays the continuous MP3 broadcast from
-[`lofi-radio`](https://github.com/luizcieslak/lofi-radio) into one Discord voice channel.
+A resilient, multi-server Discord bot that relays the continuous MP3 broadcast from
+[`lofi-radio`](https://github.com/luizcieslak/lofi-radio) into voice channels.
 
-The service runs on Node.js 24 LTS. FFmpeg converts the source stream to 48 kHz stereo Opus, while
-`@discordjs/voice` handles Discord voice transport and DAVE encryption.
+One shared FFmpeg pipeline converts the station to 48 kHz stereo Opus. Every active Discord server
+gets an independent voice connection, and saved channel assignments are restored after restarts.
 
 ## Run locally
 
-By the end of these steps, the bot will join your configured voice channel and play the live radio.
+By the end of these steps, `/lofi play` will join your voice channel and play the live radio.
 
 ### Prerequisites
 
 - Node.js 24.17 or newer
 - FFmpeg with `libopus` support
 - A Discord application with a bot user
-- A running lofi-radio `/stream` endpoint
+- A running `lofi-radio` `/stream` endpoint
 
 ### 1. Configure the Discord application
 
-In the Discord Developer Portal, create an application and bot. You do not need any privileged
-gateway intents.
+Create an application and bot in the Discord Developer Portal. No privileged gateway intents are
+required.
 
-Invite the bot using the following URL, replacing `<client-id>`:
+Invite it with the following URL, replacing `<client-id>`:
 
 ```text
 https://discord.com/oauth2/authorize?client_id=<client-id>&permissions=3146752&scope=bot%20applications.commands
 ```
 
-The permission value requests View Channel, Connect, and Speak. Copy the server ID and default
-voice-channel ID with Discord Developer Mode enabled.
+The permission value requests View Channel, Connect, and Speak.
 
 ### 2. Install and configure
 
@@ -46,8 +45,11 @@ Fill in `.env`. Never commit the bot token.
 npm run dev
 ```
 
-Open `http://localhost:3000/healthz`. It returns a healthy response as soon as the process is live.
-`http://localhost:3000/readyz` becomes successful after Discord voice and audio are both playing.
+Invite the bot to a server, join a standard voice channel, and run `/lofi play`. Use `/lofi stop`
+to disconnect it and `/lofi status` to inspect that server's state.
+
+`http://localhost:3000/healthz` reports process health. `http://localhost:3000/readyz` becomes ready
+after Discord, SQLite, and every saved active voice session are ready.
 
 ## More documentation
 

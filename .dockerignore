@@ -2,5 +2,6 @@
 .env
 .env.*
 node_modules
+.data
 coverage
 *.log

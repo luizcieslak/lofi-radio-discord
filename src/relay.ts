@@ -1,109 +1,68 @@
 import {
-	AudioPlayerStatus,
-	createAudioPlayer,
-	createAudioResource,
+	type AudioPlayer,
 	entersState,
 	joinVoiceChannel,
-	NoSubscriberBehavior,
-	StreamType,
+	type PlayerSubscription,
 	type VoiceConnection,
 	VoiceConnectionStatus,
 } from '@discordjs/voice'
-import { ChannelType, type Client } from 'discord.js'
+import { ChannelType, type Client, PermissionFlagsBits } from 'discord.js'
 import { errorMessage, logger } from './logger.ts'
-import type { MediaSource, MediaSourceFactory } from './mediaSource.ts'
 import { backoffDelay } from './retry.ts'
 import type { RuntimeStatus } from './runtimeStatus.ts'
 
-export class RadioRelay {
+export class InvalidVoiceTargetError extends Error {}
+
+export class GuildVoiceSession {
 	private readonly client: Client
 	private readonly guildId: string
-	private readonly mediaSourceFactory: MediaSourceFactory
+	private readonly player: AudioPlayer
 	private readonly status: RuntimeStatus
-	private readonly player = createAudioPlayer({
-		behaviors: { noSubscriber: NoSubscriberBehavior.Stop },
-	})
 	private desiredChannelId: string | null = null
 	private connection: VoiceConnection | null = null
-	private source: MediaSource | null = null
-	private sourceRetryTimer: NodeJS.Timeout | null = null
-	private voiceRetryTimer: NodeJS.Timeout | null = null
-	private sourceAttempts = 0
-	private voiceAttempts = 0
+	private subscription: PlayerSubscription | null = null
+	private retryTimer: NodeJS.Timeout | null = null
+	private attempts = 0
 	private stopping = false
 	private operation: Promise<void> = Promise.resolve()
 
-	constructor(
-		client: Client,
-		guildId: string,
-		mediaSourceFactory: MediaSourceFactory,
-		status: RuntimeStatus,
-	) {
+	constructor(client: Client, guildId: string, player: AudioPlayer, status: RuntimeStatus) {
 		this.client = client
 		this.guildId = guildId
-		this.mediaSourceFactory = mediaSourceFactory
+		this.player = player
 		this.status = status
-		this.player.on('error', error => {
-			if (this.stopping) return
-			this.reportError('Discord audio player failed', error)
-			this.scheduleSourceRestart('player error')
-		})
+	}
 
-		this.player.on('stateChange', (oldState, newState) => {
-			if (
-				!this.stopping &&
-				this.desiredChannelId &&
-				this.source &&
-				oldState.status !== AudioPlayerStatus.Idle &&
-				newState.status === AudioPlayerStatus.Idle
-			) {
-				this.scheduleSourceRestart('player became idle')
-			}
-		})
+	get channelId(): string | null {
+		return this.desiredChannelId
 	}
 
 	async join(channelId: string): Promise<void> {
+		this.stopping = false
 		this.desiredChannelId = channelId
-		this.status.setDesiredChannel(channelId)
-		this.clearRetries()
+		this.clearRetry()
+		this.status.setGuild(this.guildId, channelId, 'connecting')
 		try {
 			await this.enqueue(async () => this.connectNow())
 		} catch (error) {
-			this.scheduleVoiceReconnect('requested voice join failed')
+			if (!(error instanceof InvalidVoiceTargetError)) {
+				this.scheduleReconnect('requested voice join failed')
+			}
 			throw error
 		}
-	}
-
-	async leave(): Promise<void> {
-		this.desiredChannelId = null
-		this.status.setDesiredChannel(null)
-		this.clearRetries()
-		await this.enqueue(async () => this.disconnectNow())
-	}
-
-	async restartSource(): Promise<void> {
-		if (!this.desiredChannelId) throw new Error('The radio is not assigned to a voice channel')
-		await this.enqueue(async () => {
-			if (this.connection?.state.status !== VoiceConnectionStatus.Ready) {
-				await this.connectNow()
-				return
-			}
-			await this.startSourceNow()
-		})
 	}
 
 	async stop(): Promise<void> {
 		this.stopping = true
 		this.desiredChannelId = null
-		this.status.setDesiredChannel(null)
-		this.clearRetries()
+		this.clearRetry()
 		await this.enqueue(async () => this.disconnectNow())
 	}
 
 	private enqueue(task: () => Promise<void>): Promise<void> {
 		const next = this.operation.then(task, task)
 		this.operation = next.catch(error => {
-			this.reportError('Relay operation failed', error)
+			this.reportError('Voice session operation failed', error)
 		})
 		return next
 	}
@@ -112,14 +71,24 @@ export class RadioRelay {
 		const channelId = this.desiredChannelId
 		if (!channelId || this.stopping) return
 
-		await this.disconnectNow(false)
-		this.status.setDesiredChannel(channelId)
-		this.status.setVoice('connecting')
-
+		await this.disconnectNow()
+		this.status.setGuild(this.guildId, channelId, 'connecting')
 		const guild = await this.client.guilds.fetch(this.guildId)
 		const channel = await guild.channels.fetch(channelId)
 		if (!channel || channel.type !== ChannelType.GuildVoice) {
-			throw new Error(`Channel ${channelId} is not a standard guild voice channel`)
+			throw new InvalidVoiceTargetError(`Channel ${channelId} is not a standard guild voice channel`)
+		}
+
+		const botMember = guild.members.me
+		const permissions = botMember ? channel.permissionsFor(botMember) : null
+		if (
+			!permissions?.has([
+				PermissionFlagsBits.ViewChannel,
+				PermissionFlagsBits.Connect,
+				PermissionFlagsBits.Speak,
+			])
+		) {
+			throw new Error('The bot needs View Channel, Connect, and Speak permissions in that channel')
 		}
 
 		const connection = joinVoiceChannel({
@@ -129,7 +98,7 @@ export class RadioRelay {
 			selfDeaf: true,
 		})
 		this.connection = connection
-		connection.subscribe(this.player)
+		this.subscription = connection.subscribe(this.player) ?? null
 		this.watchConnection(connection)
 
 		try {
@@ -137,22 +106,17 @@ export class RadioRelay {
 		} catch (error) {
 			if (this.connection === connection) {
 				this.connection = null
+				this.subscription?.unsubscribe()
+				this.subscription = null
 				connection.destroy()
 			}
 			throw new Error('Discord voice connection did not become ready', { cause: error })
 		}
 
 		if (this.connection !== connection || this.desiredChannelId !== channelId || this.stopping) return
-		this.voiceAttempts = 0
-		this.status.setVoice('ready')
+		this.attempts = 0
+		this.status.setGuild(this.guildId, channelId, 'ready')
 		logger.info('Discord voice connection ready', { guildId: this.guildId, channelId })
-
-		try {
-			await this.startSourceNow()
-		} catch (error) {
-			this.reportError('Unable to start the radio source', error)
-			this.scheduleSourceRestart('initial source failure')
-		}
 	}
 
 	private watchConnection(connection: VoiceConnection): void {
@@ -160,8 +124,9 @@ export class RadioRelay {
 			if (this.connection !== connection || this.stopping) return
 
 			if (newState.status === VoiceConnectionStatus.Ready) {
-				this.voiceAttempts = 0
-				this.status.setVoice('ready')
+				this.attempts = 0
+				const channelId = this.desiredChannelId
+				if (channelId) this.status.setGuild(this.guildId, channelId, 'ready')
 				return
 			}
 
@@ -171,7 +136,7 @@ export class RadioRelay {
 			}
 
 			if (newState.status === VoiceConnectionStatus.Destroyed) {
-				this.scheduleVoiceReconnect('connection destroyed')
+				this.scheduleReconnect('connection destroyed')
 			}
 		})
 	}
@@ -182,122 +147,59 @@ export class RadioRelay {
 				entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
 				entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
 			])
-			logger.info('Discord voice connection is recovering')
+			logger.info('Discord voice connection is recovering', { guildId: this.guildId })
 		} catch (error) {
 			this.reportError('Discord voice connection disconnected', error)
-			this.scheduleVoiceReconnect('connection disconnected')
+			this.scheduleReconnect('connection disconnected')
 		}
 	}
 
-	private async startSourceNow(): Promise<void> {
-		if (this.stopping || this.connection?.state.status !== VoiceConnectionStatus.Ready) {
-			throw new Error('Cannot start audio without a ready voice connection')
-		}
-
-		await this.stopSource()
-		this.status.setAudio('starting')
-		const source = this.mediaSourceFactory()
-		this.source = source
-		const resource = createAudioResource(source.output, { inputType: StreamType.OggOpus })
-		this.player.play(resource)
-
-		void source.completed.then(result => {
-			if (this.source !== source || this.stopping) return
-			const reason = result.error ?? `exit code ${result.code ?? 'none'}, signal ${result.signal ?? 'none'}`
-			this.reportError(`FFmpeg stopped unexpectedly: ${reason}`)
-			this.scheduleSourceRestart('FFmpeg exited')
-		})
-
-		try {
-			await entersState(this.player, AudioPlayerStatus.Playing, 15_000)
-		} catch (error) {
-			if (this.source === source) await this.stopSource()
-			throw new Error('Discord audio player did not start', { cause: error })
-		}
-
-		if (this.source !== source || this.stopping) return
-		this.sourceAttempts = 0
-		this.status.setAudio('playing')
-		logger.info('Radio audio is playing')
-	}
-
-	private async stopSource(): Promise<void> {
-		const source = this.source
-		this.source = null
-		this.player.stop(true)
-		this.status.setAudio('idle')
-		if (source) await source.stop()
-	}
-
-	private async disconnectNow(clearDesired = true): Promise<void> {
-		await this.stopSource()
+	private async disconnectNow(): Promise<void> {
+		this.subscription?.unsubscribe()
+		this.subscription = null
 		const connection = this.connection
 		this.connection = null
 		if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy()
-		this.status.setVoice('disconnected')
-		if (clearDesired) {
-			this.status.setDesiredChannel(this.desiredChannelId)
-		}
 	}
 
-	private scheduleSourceRestart(reason: string): void {
-		if (this.stopping || !this.desiredChannelId || this.sourceRetryTimer) return
-		this.sourceAttempts += 1
-		const waitMs = backoffDelay(this.sourceAttempts)
-		this.status.setAudio('retrying')
-		logger.warn('Scheduling radio source restart', { reason, attempt: this.sourceAttempts, waitMs })
-
-		this.sourceRetryTimer = setTimeout(() => {
-			this.sourceRetryTimer = null
-			void this.enqueue(async () => {
-				try {
-					if (this.connection?.state.status === VoiceConnectionStatus.Ready) {
-						await this.startSourceNow()
-						return
-					}
-					this.scheduleVoiceReconnect('voice unavailable during source restart')
-				} catch (error) {
-					this.reportError('Radio source restart failed', error)
-					this.scheduleSourceRestart('source retry failed')
-				}
-			})
-		}, waitMs)
-		this.sourceRetryTimer.unref()
-	}
-
-	private scheduleVoiceReconnect(reason: string): void {
-		if (this.stopping || !this.desiredChannelId || this.voiceRetryTimer) return
-		this.voiceAttempts += 1
-		const waitMs = backoffDelay(this.voiceAttempts)
-		this.status.setVoice('retrying')
-		logger.warn('Scheduling Discord voice reconnect', { reason, attempt: this.voiceAttempts, waitMs })
-
-		this.voiceRetryTimer = setTimeout(() => {
-			this.voiceRetryTimer = null
+	private scheduleReconnect(reason: string): void {
+		const channelId = this.desiredChannelId
+		if (this.stopping || !channelId || this.retryTimer) return
+		this.attempts += 1
+		const waitMs = backoffDelay(this.attempts)
+		this.status.setGuild(this.guildId, channelId, 'retrying')
+		logger.warn('Scheduling Discord voice reconnect', {
+			guildId: this.guildId,
+			reason,
+			attempt: this.attempts,
+			waitMs,
+		})
+		this.retryTimer = setTimeout(() => {
+			this.retryTimer = null
 			void this.enqueue(async () => {
 				try {
 					await this.connectNow()
 				} catch (error) {
 					this.reportError('Discord voice reconnect failed', error)
-					this.scheduleVoiceReconnect('voice retry failed')
+					this.scheduleReconnect('voice retry failed')
 				}
 			})
 		}, waitMs)
-		this.voiceRetryTimer.unref()
+		this.retryTimer.unref()
 	}
 
-	private clearRetries(): void {
-		if (this.sourceRetryTimer) clearTimeout(this.sourceRetryTimer)
-		if (this.voiceRetryTimer) clearTimeout(this.voiceRetryTimer)
-		this.sourceRetryTimer = null
-		this.voiceRetryTimer = null
-		this.sourceAttempts = 0
-		this.voiceAttempts = 0
+	private clearRetry(): void {
+		if (this.retryTimer) clearTimeout(this.retryTimer)
+		this.retryTimer = null
+		this.attempts = 0
 	}
 
 	private reportError(message: string, error?: unknown): void {
 		const fullMessage = error === undefined ? message : `${message}: ${errorMessage(error)}`
-		this.status.recordError(fullMessage)
-		logger.error(message, error === undefined ? undefined : { error: errorMessage(error) })
+		this.status.recordGuildError(this.guildId, fullMessage)
+		logger.error(message, {
+			guildId: this.guildId,
+			...(error === undefined ? {} : { error: errorMessage(error) }),
+		})
 	}
 }

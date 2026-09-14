@@ -9,21 +9,23 @@ import {
 	PermissionFlagsBits,
 	SlashCommandBuilder,
 } from 'discord.js'
+import { canMoveOrStop, canPlayInChannel } from './authorization.ts'
+import { RadioBroadcast } from './broadcast.ts'
 import type { Config } from './config.ts'
 import { errorMessage, logger } from './logger.ts'
 import type { MediaSourceFactory } from './mediaSource.ts'
-import { RadioRelay } from './relay.ts'
 import { delay } from './retry.ts'
 import type { RuntimeStatus } from './runtimeStatus.ts'
+import { GuildSessionManager } from './sessionManager.ts'
+import { type AssignmentStore, importLegacyAssignment } from './stateStore.ts'
 
-const radioCommand = new SlashCommandBuilder()
-	.setName('radio')
-	.setDescription('Control the 24/7 lofi radio relay')
-	.setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+const lofiCommand = new SlashCommandBuilder()
+	.setName('lofi')
+	.setDescription('Play the shared lofi radio in a voice channel')
 	.addSubcommand(subcommand =>
 		subcommand
-			.setName('join')
-			.setDescription('Join or move to a voice channel')
+			.setName('play')
+			.setDescription('Start or move the lofi radio')
 			.addChannelOption(option =>
 				option
 					.setName('channel')
@@ -31,9 +33,10 @@ const radioCommand = new SlashCommandBuilder()
 					.addChannelTypes(ChannelType.GuildVoice),
 			),
 	)
-	.addSubcommand(subcommand => subcommand.setName('leave').setDescription('Leave voice and pause recovery'))
-	.addSubcommand(subcommand => subcommand.setName('restart').setDescription('Restart the radio audio source'))
-	.addSubcommand(subcommand => subcommand.setName('status').setDescription('Show relay health and state'))
+	.addSubcommand(subcommand =>
+		subcommand.setName('stop').setDescription('Stop the lofi radio in this server'),
+	)
+	.addSubcommand(subcommand => subcommand.setName('status').setDescription('Show lofi radio status'))
 
 export class RadioBot {
 	private readonly client = new Client({
@@ -41,17 +44,31 @@ export class RadioBot {
 	})
 	private readonly config: Config
 	private readonly status: RuntimeStatus
-	private readonly relay: RadioRelay
+	private readonly store: AssignmentStore
+	private readonly sessions: GuildSessionManager
+	private stopped = false
 
-	constructor(config: Config, status: RuntimeStatus, mediaSourceFactory: MediaSourceFactory) {
+	constructor(
+		config: Config,
+		status: RuntimeStatus,
+		mediaSourceFactory: MediaSourceFactory,
+		store: AssignmentStore,
+	) {
 		this.config = config
 		this.status = status
-		this.relay = new RadioRelay(this.client, config.discordGuildId, mediaSourceFactory, status)
+		this.store = store
+		const broadcast = new RadioBroadcast(mediaSourceFactory, status)
+		this.sessions = new GuildSessionManager(this.client, broadcast, store, status)
 
 		this.client.on(Events.InteractionCreate, interaction => {
-			if (!interaction.isChatInputCommand() || interaction.commandName !== 'radio') return
+			if (!interaction.isChatInputCommand() || interaction.commandName !== 'lofi') return
 			void this.handleCommand(interaction).catch(error => this.handleCommandError(interaction, error))
 		})
+		this.client.on(Events.GuildDelete, guild => {
+			void this.sessions.removeGuild(guild.id)
+		})
+		this.client.on(Events.ShardDisconnect, () => this.status.setGateway('disconnected'))
+		this.client.on(Events.ShardReady, () => this.status.setGateway('ready'))
 	}
 
 	async start(): Promise<void> {
@@ -61,110 +78,174 @@ export class RadioBot {
 				logger.error('Discord startup failed', { error: errorMessage(error) })
 			})
 		})
-
 		await this.client.login(this.config.discordToken)
 	}
 
 	async stop(): Promise<void> {
-		await this.relay.stop()
+		if (this.stopped) return
+		this.stopped = true
+		await this.sessions.shutdown()
 		this.client.destroy()
+		this.store.close()
 	}
 
 	private async onReady(readyClient: Client<true>): Promise<void> {
-		logger.info('Discord gateway ready', { botUserId: readyClient.user.id })
+		this.status.setGateway('ready')
+		logger.info('Discord gateway ready', {
+			botUserId: readyClient.user.id,
+			guilds: readyClient.guilds.cache.size,
+		})
 		try {
-			const guild = await readyClient.guilds.fetch(this.config.discordGuildId)
-			await guild.commands.set([radioCommand.toJSON()])
-			logger.info('Guild slash commands registered', { guildId: guild.id })
+			await readyClient.application.commands.set([lofiCommand.toJSON()])
+			logger.info('Global slash commands registered')
 		} catch (error) {
-			this.status.recordError(`Slash command registration failed: ${errorMessage(error)}`)
-			logger.error('Slash command registration failed', { error: errorMessage(error) })
+			this.status.recordError(`Global slash command registration failed: ${errorMessage(error)}`)
+			logger.error('Global slash command registration failed', { error: errorMessage(error) })
 		}
 
+		await this.importLegacyAssignment(readyClient)
 		if (this.config.startupJoinDelayMs > 0) {
-			logger.info('Waiting before the default voice join', { waitMs: this.config.startupJoinDelayMs })
+			logger.info('Waiting before restoring voice sessions', { waitMs: this.config.startupJoinDelayMs })
 			await delay(this.config.startupJoinDelayMs)
 		}
+		await this.sessions.restore()
+	}
+
+	private async importLegacyAssignment(readyClient: Client<true>): Promise<void> {
+		const legacy = this.config.legacyDefaultAssignment
+		if (!legacy) return
+
+		if (importLegacyAssignment(this.store, legacy)) {
+			logger.info('Imported legacy default voice assignment', {
+				guildId: legacy.guildId,
+				channelId: legacy.channelId,
+			})
+		}
 
 		try {
-			await this.relay.join(this.config.defaultVoiceChannelId)
+			const guild = await readyClient.guilds.fetch(legacy.guildId)
+			await guild.commands.set([])
+			logger.info('Removed legacy guild slash commands', { guildId: legacy.guildId })
 		} catch (error) {
-			this.status.recordError(`Default voice join failed: ${errorMessage(error)}`)
-			logger.error('Default voice join failed', { error: errorMessage(error) })
+			logger.warn('Could not remove legacy guild slash commands', {
+				guildId: legacy.guildId,
+				error: errorMessage(error),
+			})
 		}
 	}
 
 	private async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-		if (interaction.guildId !== this.config.discordGuildId) {
-			await interaction.reply({
-				content: 'This bot is configured for another server.',
-				flags: MessageFlags.Ephemeral,
-			})
+		const guild = interaction.guild
+		if (!guild || !interaction.guildId) {
+			await interaction.reply({ content: 'Use this command in a server.', flags: MessageFlags.Ephemeral })
 			return
 		}
 
-		if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-			await interaction.reply({
-				content: 'Manage Server permission is required.',
-				flags: MessageFlags.Ephemeral,
-			})
-			return
-		}
-
+		const member = interaction.member instanceof GuildMember ? interaction.member : null
+		const memberChannelId = member?.voice.channelId ?? null
+		const hasManageGuild = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false
+		const botChannelId = this.sessions.channelId(guild.id)
 		const subcommand = interaction.options.getSubcommand()
+
 		if (subcommand === 'status') {
-			const snapshot = this.status.snapshot()
+			const guildStatus = this.status.guildSnapshot(guild.id)
+			const serviceStatus = this.status.snapshot()
 			await interaction.reply({
-				content: [
-					`Voice: **${snapshot.voice}**`,
-					`Audio: **${snapshot.audio}**`,
-					`Desired channel: ${snapshot.desiredChannelId ? `<#${snapshot.desiredChannelId}>` : 'none'}`,
-					`Uptime: ${snapshot.uptimeSeconds}s`,
-					`Last error: ${snapshot.lastError ?? 'none'}`,
-				].join('\n'),
+				content: guildStatus
+					? [
+							`Voice: **${guildStatus.voice}**`,
+							`Audio: **${serviceStatus.broadcast}**`,
+							`Channel: <#${guildStatus.desiredChannelId}>`,
+							`Last error: ${guildStatus.lastError ?? serviceStatus.lastError ?? 'none'}`,
+						].join('\n')
+					: 'The lofi radio is stopped in this server.',
+				flags: MessageFlags.Ephemeral,
+			})
+			return
+		}
+
+		if (subcommand === 'stop') {
+			if (!botChannelId) {
+				await interaction.reply({
+					content: 'The lofi radio is already stopped in this server.',
+					flags: MessageFlags.Ephemeral,
+				})
+				return
+			}
+			if (!canMoveOrStop({ hasManageGuild, memberChannelId, botChannelId })) {
+				await interaction.reply({
+					content: 'Join the bot’s voice channel or use an account with Manage Server permission.',
+					flags: MessageFlags.Ephemeral,
+				})
+				return
+			}
+			await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+			await this.sessions.stop(guild.id)
+			await interaction.editReply('Stopped the lofi radio in this server.')
+			return
+		}
+
+		const selected = interaction.options.getChannel('channel')
+		const targetChannelId = selected?.type === ChannelType.GuildVoice ? selected.id : memberChannelId
+		if (!targetChannelId) {
+			await interaction.reply({
+				content: 'Join a voice channel or choose one before using `/lofi play`.',
+				flags: MessageFlags.Ephemeral,
+			})
+			return
+		}
+		if (!botChannelId && !canPlayInChannel({ hasManageGuild, memberChannelId }, targetChannelId)) {
+			await interaction.reply({
+				content: 'You can only start the radio in your own voice channel.',
+				flags: MessageFlags.Ephemeral,
+			})
+			return
+		}
+		if (botChannelId && !canMoveOrStop({ hasManageGuild, memberChannelId, botChannelId })) {
+			await interaction.reply({
+				content: 'Only members in the bot’s current channel or server managers can control it.',
+				flags: MessageFlags.Ephemeral,
+			})
+			return
+		}
+
+		const targetChannel = await guild.channels.fetch(targetChannelId)
+		if (!targetChannel || targetChannel.type !== ChannelType.GuildVoice) {
+			await interaction.reply({
+				content: 'Choose a standard server voice channel.',
+				flags: MessageFlags.Ephemeral,
+			})
+			return
+		}
+		const botMember = guild.members.me
+		const botPermissions = botMember ? targetChannel.permissionsFor(botMember) : null
+		if (
+			!botPermissions?.has([
+				PermissionFlagsBits.ViewChannel,
+				PermissionFlagsBits.Connect,
+				PermissionFlagsBits.Speak,
+			])
+		) {
+			await interaction.reply({
+				content: 'I need View Channel, Connect, and Speak permissions in that voice channel.',
 				flags: MessageFlags.Ephemeral,
 			})
 			return
 		}
 
 		await interaction.deferReply({ flags: MessageFlags.Ephemeral })
-
-		if (subcommand === 'leave') {
-			await this.relay.leave()
-			await interaction.editReply('Disconnected. Automatic recovery is paused until `/radio join`.')
-			return
-		}
-
-		if (subcommand === 'restart') {
-			await this.relay.restartSource()
-			await interaction.editReply('The radio audio source was restarted.')
-			return
-		}
-
-		if (subcommand === 'join') {
-			const selected = interaction.options.getChannel('channel')
-			let channelId: string | null = null
-			if (selected?.type === ChannelType.GuildVoice) {
-				channelId = selected.id
-			} else if (interaction.member instanceof GuildMember) {
-				const memberChannel = interaction.member.voice.channel
-				if (memberChannel?.type === ChannelType.GuildVoice) channelId = memberChannel.id
-			}
-
-			if (!channelId) {
-				await interaction.editReply('Choose a voice channel or join one before running this command.')
-				return
-			}
-
-			await this.relay.join(channelId)
-			await interaction.editReply(`Streaming in <#${channelId}>.`)
-		}
+		await this.sessions.play(guild.id, targetChannelId)
+		await interaction.editReply(`Streaming lofi in <#${targetChannelId}>.`)
 	}
 
 	private async handleCommandError(interaction: ChatInputCommandInteraction, error: unknown): Promise<void> {
 		const message = errorMessage(error)
-		logger.error('Slash command failed', { error: message, userId: interaction.user.id })
-		const content = `The radio command failed: ${message}`
+		logger.error('Slash command failed', {
+			error: message,
+			guildId: interaction.guildId,
+			userId: interaction.user.id,
+		})
+		const content = `The lofi command failed: ${message}. Automatic recovery will keep trying when possible.`
 
 		try {
 			if (interaction.deferred || interaction.replied) {
