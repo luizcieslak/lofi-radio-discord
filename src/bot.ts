@@ -36,7 +36,9 @@ const radioCommand = new SlashCommandBuilder()
 	.addSubcommand(subcommand => subcommand.setName('status').setDescription('Show relay health and state'))
 
 export class RadioBot {
-	private readonly client = new Client({ intents: [GatewayIntentBits.Guilds] })
+	private readonly client = new Client({
+		intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+	})
 	private readonly config: Config
 	private readonly status: RuntimeStatus
 	private readonly relay: RadioRelay
